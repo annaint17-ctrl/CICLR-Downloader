@@ -1,4 +1,5 @@
 import csv, io, json, re, time, zipfile
+from xml.etree import ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote, urlparse
 import ipaddress, socket
@@ -9,7 +10,7 @@ import streamlit as st
 st.set_page_config(page_title='CICLR Full-Text Finder', page_icon='📚', layout='wide')
 HEADERS={'User-Agent':'CICLRResearchFullTextFinder/1.0 (academic literature discovery; contact via deployed app owner)','Accept':'application/json'}
 PDF_HEADERS={'User-Agent':'Mozilla/5.0 (compatible; CICLR academic literature downloader)','Accept':'application/pdf,*/*'}
-MAX_PDF=25*1024*1024
+MAX_PDF=35*1024*1024
 
 
 def normalize_doi(v):
@@ -57,8 +58,32 @@ def pdf_candidates(rec):
                 pmcid=results[0].get('pmcid')
                 if pmcid:
                     pages.append('https://europepmc.org/articles/'+pmcid)
-                    candidates.append('https://europepmc.org/articles/'+pmcid+'?page=1&pdf=render')
+                    candidates.extend([
+                        'https://europepmc.org/articles/'+pmcid+'?page=1&pdf=render',
+
+                    ])
+    # Common alternate repository paths for Europe PMC and PMC; PDF responses are signature checked.
+    pmcids=re.findall(r'PMC\d+', ' '.join(pages), flags=re.I)
+    for pmcid in dict.fromkeys(pmcids):
+        pages.append('https://pmc.ncbi.nlm.nih.gov/articles/'+pmcid+'/')
+        candidates.extend([
+            'https://www.ncbi.nlm.nih.gov/pmc/articles/'+pmcid+'/pdf/',
+            'https://europepmc.org/articles/'+pmcid+'?page=1&pdf=render',
+        ])
     return list(dict.fromkeys(candidates)),list(dict.fromkeys(pages)),notes
+
+def get_xml_fulltext(pages):
+    for pmcid in dict.fromkeys(re.findall(r'PMC\d+', ' '.join(pages), flags=re.I)):
+        url='https://www.ebi.ac.uk/europepmc/webservices/rest/'+pmcid+'/fullTextXML'
+        if not public_url(url): continue
+        try:
+            r=requests.get(url,timeout=(8,25),headers={'User-Agent':HEADERS['User-Agent']},allow_redirects=False)
+            if r.status_code!=200 or len(r.content)>12*1024*1024:continue
+            root=ET.fromstring(r.content)
+            if root.tag not in ('article','{http://www.ncbi.nlm.nih.gov/JATS1}article') and not root.tag.endswith('}article'):continue
+            return r.content,url
+        except (requests.RequestException,ET.ParseError):continue
+    return None,''
 
 def download_pdf(url):
     if not public_url(url):return None,'URL not approved (HTTPS/public host required)'
@@ -113,10 +138,12 @@ if records:
     c1,c2=st.columns(2)
     start=c1.number_input('Starting record (1-based)',min_value=1,max_value=len(records),value=1,step=1)
     batch=c2.number_input('Batch size',min_value=1,max_value=min(100,len(records)),value=min(25,len(records)),step=1)
+    xml_fallback=st.checkbox('Save available open-access full-text XML when PDF retrieval fails',value=True)
+    st.caption('XML is complete machine-readable article text where licensed, but is not the publisher PDF. PDF and XML files are kept separate.')
     chosen=records[int(start)-1:int(start)-1+int(batch)]
     st.caption(f'Selected {len(chosen)} records: {chosen[0]["id"]} through {chosen[-1]["id"]}')
     if st.button('Find and download PDFs',type='primary'):
-        rows=[]; found={};progress=st.progress(0);status=st.empty()
+        rows=[]; found={}; xml_found={};progress=st.progress(0);status=st.empty()
         for i,rec in enumerate(chosen):
             ident=rec['id'];status.write(f'Checking {i+1}/{len(chosen)}: {ident}')
             candidates,pages,notes=pdf_candidates(rec)
@@ -130,21 +157,28 @@ if records:
                     if name in found:name=f'{safe_id}_{i+1}.pdf'
                     found[name]=data;result='Downloaded';success_url=url;failure='';break
                 failure=(failure+'; ' if failure else '')+detail
-            if result!='Downloaded' and candidates:result='PDF URL found, download failed'
+            xml_url=''
+            if result!='Downloaded' and xml_fallback:
+                xml_data,xml_url=get_xml_fulltext(pages)
+                if xml_data:
+                    xml_found[re.sub(r'[^A-Za-z0-9_-]','_',ident)+'.xml']=xml_data
+                    result='Full text XML retrieved (PDF unavailable)'
+            if result not in ('Downloaded','Full text XML retrieved (PDF unavailable)') and candidates:result='PDF URL found, download failed'
             elif result!='Downloaded' and pages:result='Full-text/landing page only'
-            rows.append({'id':ident,'title':rec.get('title',''),'year':rec.get('year',''),'doi':normalize_doi(rec.get('doi')),'pmid':rec.get('pmid',''),'status':result,'downloaded_pdf':(name if result=='Downloaded' else ''),'successful_pdf_url':success_url,'candidate_pdf_urls':' | '.join(candidates),'page_urls':' | '.join(pages),'failure_details':failure,'lookup_notes':' | '.join(notes)})
+            rows.append({'id':ident,'title':rec.get('title',''),'year':rec.get('year',''),'doi':normalize_doi(rec.get('doi')),'pmid':rec.get('pmid',''),'status':result,'downloaded_pdf':(name if result=='Downloaded' else ''),'successful_pdf_url':success_url,'full_text_xml_url':xml_url,'candidate_pdf_urls':' | '.join(candidates),'page_urls':' | '.join(pages),'failure_details':failure,'lookup_notes':' | '.join(notes)})
             progress.progress((i+1)/len(chosen))
             time.sleep(.15)
         output=io.BytesIO()
         csv_out=io.StringIO();w=csv.DictWriter(csv_out,fieldnames=rows[0].keys());w.writeheader();w.writerows(rows)
         with zipfile.ZipFile(output,'w',compression=zipfile.ZIP_DEFLATED) as z:
             for filename,data in found.items():z.writestr('PDFs/'+filename,data)
+            for filename,data in xml_found.items():z.writestr('Full_Text_XML/'+filename,data)
             z.writestr('retrieval_report.csv',csv_out.getvalue().encode('utf-8-sig'))
-            z.writestr('README.txt',f'CICLR retrieval batch. Records checked: {len(rows)}. Verified PDFs: {len(found)}. Other records: {len(rows)-len(found)}. Review retrieval_report.csv for all statuses.\n')
+            z.writestr('README.txt',f'CICLR retrieval batch. Records checked: {len(rows)}. Verified PDFs: {len(found)}. Full-text XML alternatives: {len(xml_found)}. Other records: {len(rows)-len(found)}. Review retrieval_report.csv for all statuses.\n')
         st.session_state['result_zip']=output.getvalue()
         st.session_state['result_csv']=csv_out.getvalue().encode('utf-8-sig')
         st.session_state['result_rows']=rows
-        status.success(f'Finished: {len(found)} verified PDFs out of {len(rows)} records')
+        status.success(f'Finished: {len(found)} verified PDFs + {len(xml_found)} full-text XML alternatives out of {len(rows)} records')
     if 'result_rows' in st.session_state:
         df=pd.DataFrame(st.session_state['result_rows'])
         st.subheader('Retrieval results')
